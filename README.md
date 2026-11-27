@@ -54,8 +54,8 @@ rag-chatbot/
 
 ### 1. Clone the repository
 ```bash
-git clone https://github.com/your-username/your-repo-name.git
-cd your-repo-name
+git clone https://github.com/RadiantHAL/AI-RAG.git
+cd AI-RAG
 ```
 
 ### 2. Create and activate a virtual environment
@@ -132,7 +132,7 @@ To help first-time visitors explore the knowledge base immediately, `app.py` ren
    git add .
    git commit -m "Initial commit: AI & ML Knowledge Assistant RAG chatbot"
    git branch -M main
-   git remote add origin https://github.com/your-username/your-repo-name.git
+   git remote add origin https://github.com/RadiantHAL/AI-RAG.git
    git push -u origin main
    ```
    Verify that `.venv/`, `__pycache__/`, `.env`, and any API keys are **not** included (`.gitignore` handles this automatically).
