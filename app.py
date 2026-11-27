@@ -127,11 +127,14 @@ def _ensure_vector_store(
     if not chunks:
         raise DocumentLoadError("Document chunking produced zero chunks.")
 
+    status_placeholder = st.empty()
     vector_store = InMemoryVectorStore.from_chunks(
         client=client,
         chunks=chunks,
         embed_model=DEFAULT_EMBED_MODEL,
+        status_callback=lambda msg: status_placeholder.info(msg),
     )
+    status_placeholder.empty()
 
     st.session_state.vector_store = vector_store
     st.session_state.index_signature = signature

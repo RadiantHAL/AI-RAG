@@ -13,9 +13,10 @@ from __future__ import annotations
 
 import io
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, NoReturn
+from typing import Callable, Iterable, NoReturn
 
 import numpy as np
 from google import genai
@@ -28,6 +29,7 @@ KNOWLEDGE_BASE_DIR = Path(__file__).resolve().parent / "knowledge_base"
 
 # Current supported Gemini API models (non-deprecated).
 DEFAULT_CHAT_MODEL = "gemini-3.8-flash"
+FALLBACK_CHAT_MODELS = ("gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.5-flash-lite")
 DEFAULT_EMBED_MODEL = "gemini-embedding-001"
 
 SUPPORTED_EXTENSIONS = {".pdf", ".txt", ".md"}
@@ -286,31 +288,64 @@ def _l2_normalize(vectors: np.ndarray) -> np.ndarray:
     return vectors / norms
 
 
+def _extract_retry_seconds(message: str, default: int = 62) -> int:
+    """Extract retry delay seconds from a Gemini 429 error message if present."""
+    match = re.search(r"retry in (\d+(?:\.\d+)?)s", message, re.IGNORECASE)
+    if match:
+        return max(1, int(float(match.group(1))) + 2)
+    return default
+
+
 def embed_texts(
     client: genai.Client,
     texts: list[str],
     task_type: str = "RETRIEVAL_DOCUMENT",
     model: str = DEFAULT_EMBED_MODEL,
     batch_size: int = 50,
+    max_rate_limit_retries: int = 3,
+    status_callback: Callable[[str], None] | None = None,
 ) -> np.ndarray:
-    """Generate L2-normalized Gemini embeddings for a list of texts."""
+    """Generate L2-normalized Gemini embeddings for a list of texts.
+
+    Automatically handles Gemini Free Tier rate limits (100 embed requests/min)
+    by pausing and retrying when a 429 RESOURCE_EXHAUSTED error is returned.
+    """
     if not texts:
         return np.empty((0, 0), dtype=np.float32)
 
     all_vectors: list[list[float]] = []
+    total_batches = (len(texts) + batch_size - 1) // batch_size
 
-    for start in range(0, len(texts), batch_size):
+    for batch_idx, start in enumerate(range(0, len(texts), batch_size), start=1):
         batch = texts[start : start + batch_size]
-        try:
-            response = client.models.embed_content(
-                model=model,
-                contents=batch,
-                config=types.EmbedContentConfig(task_type=task_type),
-            )
-        except (genai_errors.APIError, Exception) as exc:
-            _raise_friendly_api_error(exc)
+        if status_callback:
+            status_callback(f"Embedding batch {batch_idx}/{total_batches}...")
 
-        if not response.embeddings:
+        response = None
+        for attempt in range(max_rate_limit_retries + 1):
+            try:
+                response = client.models.embed_content(
+                    model=model,
+                    contents=batch,
+                    config=types.EmbedContentConfig(task_type=task_type),
+                )
+                break
+            except (genai_errors.APIError, Exception) as exc:
+                lowered = str(exc).lower()
+                is_rate_limit = (
+                    "429" in lowered or "resource_exhausted" in lowered or "quota" in lowered
+                )
+                if is_rate_limit and attempt < max_rate_limit_retries:
+                    wait_s = _extract_retry_seconds(str(exc))
+                    if status_callback:
+                        status_callback(
+                            f"Free-tier rate limit reached; waiting {wait_s}s before batch {batch_idx}/{total_batches}..."
+                        )
+                    time.sleep(wait_s)
+                    continue
+                _raise_friendly_api_error(exc)
+
+        if response is None or not response.embeddings:
             raise RAGError("Gemini embedding API returned no embeddings.")
 
         for emb in response.embeddings:
@@ -335,6 +370,7 @@ class InMemoryVectorStore:
         client: genai.Client,
         chunks: list[TextChunk],
         embed_model: str = DEFAULT_EMBED_MODEL,
+        status_callback: Callable[[str], None] | None = None,
     ) -> "InMemoryVectorStore":
         """Embed all chunks and return a ready-to-query InMemoryVectorStore."""
         if not chunks:
@@ -345,6 +381,7 @@ class InMemoryVectorStore:
             texts=texts,
             task_type="RETRIEVAL_DOCUMENT",
             model=embed_model,
+            status_callback=status_callback,
         )
         return cls(chunks=chunks, embeddings=embeddings)
 
@@ -433,17 +470,31 @@ def generate_grounded_answer(
         "Answer (strictly from the Context Excerpts, with [n] citations):"
     )
 
-    try:
-        response = client.models.generate_content(
-            model=model,
-            contents=user_prompt,
-            config=types.GenerateContentConfig(
-                system_instruction=system_instruction,
-                temperature=0.1,
-            ),
-        )
-    except (genai_errors.APIError, Exception) as exc:
-        _raise_friendly_api_error(exc)
+    candidate_models = [model] + [m for m in FALLBACK_CHAT_MODELS if m != model]
+    response = None
+    last_exc: Exception | None = None
+
+    for candidate in candidate_models:
+        try:
+            response = client.models.generate_content(
+                model=candidate,
+                contents=user_prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=system_instruction,
+                    temperature=0.1,
+                ),
+            )
+            break
+        except (genai_errors.APIError, Exception) as exc:
+            last_exc = exc
+            lowered = str(exc).lower()
+            if "503" in lowered or "unavailable" in lowered or "high demand" in lowered:
+                time.sleep(2)
+                continue
+            _raise_friendly_api_error(exc)
+
+    if response is None and last_exc is not None:
+        _raise_friendly_api_error(last_exc)
 
     answer = (response.text or "").strip()
     return answer if answer else FALLBACK_RESPONSE
